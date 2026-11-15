@@ -1,0 +1,184 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Serverless webhook bridge: receives third-party webhooks, verifies and validates them,
+  archives the raw payload, and delivers them reliably to a downstream REST API.
+
+Parameters:
+  DownstreamUrl:
+    Type: String
+    Description: Base URL of the REST API that receives the mapped events
+  WebhookSecretArn:
+    Type: String
+    Description: ARN of the Secrets Manager secret holding the webhook signing secret
+  AlarmEmail:
+    Type: String
+    Description: Where DLQ / error alarms are sent
+
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Architectures: [arm64]
+    MemorySize: 256
+    Timeout: 30
+    Tracing: Active
+    CodeUri: dist/
+    LoggingConfig:
+      LogFormat: JSON
+
+Resources:
+  # ---------- Edge ----------
+  WebhookApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 50
+        ThrottlingRateLimit: 20
+
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: ingest.handler
+      Timeout: 10
+      Environment:
+        Variables:
+          RAW_BUCKET: !Ref RawPayloadBucket
+          QUEUE_URL: !Ref EventsQueue
+          WEBHOOK_SECRET_ARN: !Ref WebhookSecretArn
+      Policies:
+        - S3WritePolicy: { BucketName: !Ref RawPayloadBucket }
+        - SQSSendMessagePolicy: { QueueName: !GetAtt EventsQueue.QueueName }
+        - AWSSecretsManagerGetSecretValuePolicy: { SecretArn: !Ref WebhookSecretArn }
+      Events:
+        Webhook:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref WebhookApi
+            Method: POST
+            Path: /webhooks/orders
+
+  # ---------- Storage ----------
+  RawPayloadBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-raw-payloads
+            Status: Enabled
+            ExpirationInDays: 90
+
+  IdempotencyTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+
+  # ---------- Queue + worker ----------
+  EventsDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600 # 14 days to inspect and replay
+
+  EventsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 180 # 6x the worker timeout, per AWS guidance
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt EventsDLQ.Arn
+        maxReceiveCount: 3
+
+  WorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: worker.handler
+      Environment:
+        Variables:
+          IDEMPOTENCY_TABLE: !Ref IdempotencyTable
+          DOWNSTREAM_URL: !Ref DownstreamUrl
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref IdempotencyTable }
+      Events:
+        Queue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt EventsQueue.Arn
+            BatchSize: 10
+            FunctionResponseTypes: [ReportBatchItemFailures]
+            ScalingConfig:
+              MaximumConcurrency: 5 # protects the downstream API's rate limit
+
+  # ---------- Alerting ----------
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - { Protocol: email, Endpoint: !Ref AlarmEmail }
+
+  DLQNotEmptyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Events failed 3 times and are waiting in the DLQ
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - { Name: QueueName, Value: !GetAtt EventsDLQ.QueueName }
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  QueueBacklogAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Oldest message waited more than 10 minutes (downstream slow or worker failing)
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions:
+        - { Name: QueueName, Value: !GetAtt EventsQueue.QueueName }
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 600
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  WorkerErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Worker Lambda is throwing errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - { Name: FunctionName, Value: !Ref WorkerFunction }
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+Outputs:
+  WebhookUrl:
+    Description: Give this URL to the third-party platform
+    Value: !Sub https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/webhooks/orders
+  DeadLetterQueueUrl:
+    Value: !Ref EventsDLQ
